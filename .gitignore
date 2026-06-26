@@ -1,0 +1,14 @@
+.idea
+.venv
+.jbeval
+__pycache__/
+**/__pycache__/
+data/**/*.bin
+data/**/tokenizer/
+checkpoints/**/*.pt
+experiments/*/
+!experiments/.gitkeep
+uv.lock
+/docs
+/data
+/experiments
