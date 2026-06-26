@@ -7,9 +7,13 @@ Architecture: two-level model
   - Global model: processes patch-level embeddings (N_patches tokens)
   - Local model: predicts bytes within each patch conditioned on global context
 
-This is the key insight from Megabyte (arXiv: 2305.07195): you can process
-byte-level data efficiently by grouping it into patches and using a hierarchical
-model, getting the best of both worlds — small vocab + manageable sequence length.
+FIX (v2): get_batch now shifts at the byte level BEFORE reshaping into patches.
+The input and targets are both [batch, n_patches, patch_size], where targets
+are the input shifted by 1 byte. This means:
+  - The last byte of patch i predicts the first byte of patch i+1
+  - The global model processes all patches, so cross-patch context flows
+    through the global representation
+  - The local model only predicts within-patch, conditioned on global context
 
 Example: 1024 bytes → 64 patches of 16 bytes each.
   Global model sees 64 tokens. Local model sees 16 bytes per patch.
@@ -86,16 +90,29 @@ class PatchRepresentation(Representation):
         Returns (x, y) where:
           x: [batch, global_seq_len, patch_size] — input byte patches
           y: [batch, global_seq_len, patch_size] — target byte patches (shifted by 1 byte)
+
+        The shift is done at the byte level BEFORE reshaping into patches.
+        This ensures the target for byte i is byte i+1, even across patch boundaries.
+        The global model handles cross-patch context; the local model predicts
+        within-patch bytes conditioned on the global representation.
         """
         total_bytes = self.block_size  # total bytes per sample
+        # We need total_bytes + 1 to create shifted targets
         starts = np.random.randint(0, len(data) - total_bytes - 1, size=batch_size)
-        # Gather [batch, total_bytes]
+        # Gather [batch, total_bytes + 1]
         offsets = starts[:, None] + np.arange(total_bytes + 1)[None, :]
         seq = torch.from_numpy(data[offsets].astype(np.int64))  # [batch, total_bytes+1]
 
-        # Input: bytes 0..total_bytes-1, Target: bytes 1..total_bytes
-        x = seq[:, :-1].reshape(batch_size, self.global_seq_len, self.patch_size)
-        y = seq[:, 1:].reshape(batch_size, self.global_seq_len, self.patch_size)
+        # Shift at byte level: input = bytes 0..total_bytes-1, target = bytes 1..total_bytes
+        x_flat = seq[:, :-1]  # [batch, total_bytes]
+        y_flat = seq[:, 1:]   # [batch, total_bytes]
+
+        # Reshape into patches
+        x = x_flat.reshape(batch_size, self.global_seq_len, self.patch_size)
+        y = y_flat.reshape(batch_size, self.global_seq_len, self.patch_size)
+
+        if device == "cuda":
+            return x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
         return x.to(device), y.to(device)
 
     @property

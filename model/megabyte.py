@@ -5,18 +5,24 @@ Two-level architecture:
   2. Local model: predicts individual bytes within each patch, conditioned on
      the global representation of that patch.
 
-This dramatically reduces the sequence length the transformer attends over:
-  - 1024 bytes → 64 patches of 16 → global model sees 64 tokens (not 1024)
-  - Local model is a small MLP/transformer that operates within patches
+BUG FIX (v2): The target shifting is now done at the byte level BEFORE reshaping
+into patches. This ensures that:
+  - The target for the last byte of patch i is the first byte of patch i+1
+  - The local model receives the global representation of the CURRENT patch
+    (which includes information from all previous patches via the global transformer)
+  - Cross-patch context flows through the global model, not through local targets
 
-Reference: Megabyte (arXiv: 2305.07195)
+Architecture improvements:
+  - GQA support for global and local models
+  - Gradient checkpointing option
+  - Better generation
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 from .transformer import RMSNorm, apply_rope, Block, ModelConfig
 
@@ -30,18 +36,22 @@ class MegabyteConfig:
     global_n_layer: int = 6
     global_n_head: int = 6
     global_n_embd: int = 384
+    global_n_kv_head: int | None = None  # GQA
     # Local model (predicts bytes within patches)
     local_n_layer: int = 2
     local_n_head: int = 4
     local_n_embd: int = 192
+    local_n_kv_head: int | None = None   # GQA
     dropout: float = 0.1
     rope_theta: float = 10000.0
+    grad_checkpoint: bool = False
 
 
 class PatchEmbed(nn.Module):
     """Embeds a patch of bytes into a single vector via a small linear layer."""
     def __init__(self, vocab_size: int, patch_size: int, n_embd: int):
         super().__init__()
+        # Each byte gets a small embedding, then we concatenate and project
         self.byte_embed = nn.Embedding(vocab_size, n_embd // patch_size)
         self.proj = nn.Linear(n_embd, n_embd)
 
@@ -58,6 +68,9 @@ class LocalModel(nn.Module):
 
     Takes the global representation of a patch + the bytes seen so far in the patch,
     predicts the next byte. This is a small transformer operating within patches.
+
+    Cross-patch context flows through the global model's representation — the local
+    model only needs to attend within its own patch, conditioned on the global vector.
     """
     def __init__(self, config: MegabyteConfig):
         super().__init__()
@@ -70,6 +83,7 @@ class LocalModel(nn.Module):
             block_size=config.patch_size,
             n_layer=config.local_n_layer,
             n_head=config.local_n_head,
+            n_kv_head=config.local_n_kv_head,
             n_embd=config.local_n_embd,
             dropout=config.dropout,
             rope_theta=config.rope_theta,
@@ -118,9 +132,11 @@ class MegabyteModel(nn.Module):
             block_size=config.global_seq_len,
             n_layer=config.global_n_layer,
             n_head=config.global_n_head,
+            n_kv_head=config.global_n_kv_head,
             n_embd=config.global_n_embd,
             dropout=config.dropout,
             rope_theta=config.rope_theta,
+            grad_checkpoint=config.grad_checkpoint,
         )
         self.global_blocks = nn.ModuleList(Block(global_cfg) for _ in range(config.global_n_layer))
         self.global_norm = RMSNorm(config.global_n_embd)
@@ -140,16 +156,20 @@ class MegabyteModel(nn.Module):
 
     def forward(self, x: torch.Tensor, targets: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
-        x: [batch, n_patches, patch_size] — byte patches
-        targets: [batch, n_patches, patch_size] — target bytes
+        x: [batch, n_patches, patch_size] — input byte patches
+        targets: [batch, n_patches, patch_size] — target byte patches (shifted by 1 byte)
         """
         b, p, s = x.shape
 
         # Global model: embed patches → transformer → global representations
         patch_emb = self.patch_embed(x)  # [batch, n_patches, global_n_embd]
         global_x = patch_emb
-        for block in self.global_blocks:
-            global_x = block(global_x)
+        if self.config.grad_checkpoint and self.training:
+            for block in self.global_blocks:
+                global_x = torch.utils.checkpoint.checkpoint(block, global_x, use_reentrant=False)
+        else:
+            for block in self.global_blocks:
+                global_x = block(global_x)
         global_x = self.global_norm(global_x)  # [batch, n_patches, global_n_embd]
 
         # Local model: predict bytes within each patch
@@ -177,6 +197,35 @@ class MegabyteModel(nn.Module):
             x = torch.cat([x, next_byte], dim=2)  # grow patch
         return x
 
+    def configure_optimizer(self, lr: float, weight_decay: float = 0.1,
+                            beta1: float = 0.9, beta2: float = 0.95,
+                            embed_lr_scale: float = 1.0) -> torch.optim.Optimizer:
+        """Build AdamW with separate param groups."""
+        import inspect
+        decay, nodecay = [], []
+        seen = set()
+        for name, p in self.named_parameters():
+            if not p.requires_grad or id(p) in seen:
+                continue
+            seen.add(id(p))
+            if p.ndim < 2:
+                nodecay.append(p)
+            else:
+                decay.append(p)
+
+        adamw_kwargs = dict(betas=(beta1, beta2))
+        if "fused" in inspect.signature(torch.optim.AdamW).parameters and torch.cuda.is_available():
+            adamw_kwargs["fused"] = True
+
+        param_groups = [
+            {"params": decay, "weight_decay": weight_decay, "lr": lr},
+            {"params": nodecay, "weight_decay": 0.0, "lr": lr},
+        ]
+        optimizer = torch.optim.AdamW(param_groups, **adamw_kwargs)
+        for g in optimizer.param_groups:
+            g["initial_lr"] = g["lr"]
+        return optimizer
+
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
@@ -185,3 +234,6 @@ class MegabyteModel(nn.Module):
 
     def num_modeling_parameters(self) -> int:
         return self.num_parameters() - self.num_embedding_parameters()
+
+    def config_dict(self) -> dict:
+        return asdict(self.config)

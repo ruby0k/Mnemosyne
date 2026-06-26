@@ -29,7 +29,7 @@ def download_tinystories(raw_dir: Path, max_docs: int = 5000) -> None:
 
 
 def prepare_all_representations(raw_dir: Path, data_root: Path, max_docs: int = -1) -> None:
-    """Prepare data for all representations."""
+    """Prepare data for all representations (or a filtered subset)."""
     from representations.byte import ByteRepresentation
     from representations.char import CharRepresentation
     from representations.bpe import BPERepresentation
@@ -53,7 +53,14 @@ def prepare_all_representations(raw_dir: Path, data_root: Path, max_docs: int = 
         ("bpe_dropout", BPEDropoutRepresentation(block_size=256, dropout_prob=0.1)),
         ("ngram2", NgramByteRepresentation(block_size=512, n=2, max_vocab=8000)),
         ("ngram3", NgramByteRepresentation(block_size=384, n=3, max_vocab=8000)),
+        # Mamba uses byte-level data (same as byte) but with longer context
+        ("mamba", ByteRepresentation(block_size=2048)),
     ]
+
+    # Filter reps if _reps_filter is set
+    reps_filter = globals().get("_reps_filter", None)
+    if reps_filter:
+        reps = [(name, rep) for name, rep in reps if name in reps_filter]
 
     for name, rep in reps:
         out_dir = data_root / name
@@ -68,6 +75,8 @@ def main():
     parser.add_argument("--data-root", default="data", help="Root for representation data")
     parser.add_argument("--max-docs", type=int, default=5000, help="Number of documents (0=all)")
     parser.add_argument("--skip-download", action="store_true", help="Skip download if already have raw data")
+    parser.add_argument("--reps", type=str, default=None,
+                        help="Comma-separated list of reps to prepare (default: all)")
     args = parser.parse_args()
 
     raw_dir = Path(args.raw_dir)
@@ -75,6 +84,10 @@ def main():
 
     if not args.skip_download:
         download_tinystories(raw_dir, max_docs=args.max_docs)
+
+    # Filter reps if specified
+    global _reps_filter
+    _reps_filter = args.reps.split(",") if args.reps else None
 
     prepare_all_representations(raw_dir, data_root, max_docs=args.max_docs)
     print("\n✓ All representations prepared.")
