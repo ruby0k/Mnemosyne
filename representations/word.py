@@ -106,10 +106,10 @@ class WordRepresentation(Representation):
                 "train_tokens": len(train), "val_tokens": len(val),
                 "dtype": "uint16" if dtype == np.uint16 else "uint8",
                 "chars_per_token": cpt}
-        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
         # Save vocab
-        (out_dir / "vocab.json").write_text(json.dumps(self._word2id))
+        (out_dir / "vocab.json").write_text(json.dumps(self._word2id), encoding="utf-8")
 
         return meta
 
@@ -117,7 +117,7 @@ class WordRepresentation(Representation):
         """Load vocabulary from a prepared data directory."""
         vocab_path = Path(data_dir) / "vocab.json"
         if vocab_path.exists():
-            self._word2id = json.loads(vocab_path.read_text())
+            self._word2id = json.loads(vocab_path.read_text(encoding="utf-8"))
             self._id2word = {v: k for k, v in self._word2id.items()}
 
     def bpc_from_loss(self, loss: float) -> float:

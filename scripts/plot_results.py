@@ -14,6 +14,12 @@ import json
 import sys
 from pathlib import Path
 
+# Force UTF-8 console output: Windows consoles default to a locale codec
+# (e.g. cp1250) that can't encode the → / ✓ characters in progress messages.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend
 import matplotlib.pyplot as plt
@@ -26,7 +32,7 @@ def load_metrics(exp_dir: Path) -> dict[str, dict]:
     for f in sorted(exp_dir.glob("*_metrics.json")):
         name = f.stem.replace("_metrics", "")
         try:
-            metrics[name] = json.loads(f.read_text())
+            metrics[name] = json.loads(f.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             pass
     return metrics

@@ -17,6 +17,7 @@ Improvements (v2):
 import argparse
 import json
 import math
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -49,7 +50,7 @@ def load_representation(name: str, data_dir: str):
     from representations.bpe_dropout import BPEDropoutRepresentation
     from representations.ngram import NgramByteRepresentation
 
-    meta = json.loads((Path(data_dir) / "meta.json").read_text())
+    meta = json.loads((Path(data_dir) / "meta.json").read_text(encoding="utf-8"))
     block_size = meta["block_size"]
 
     # Map rep name to class and construction args
@@ -57,6 +58,11 @@ def load_representation(name: str, data_dir: str):
         rep = ByteRepresentation(block_size=block_size)
     elif name == "char":
         rep = CharRepresentation(block_size=block_size)
+        # Restore the saved vocab: without this, char_to_id/id_to_char stay empty
+        # (encode→all zeros, decode→empty) and vocab_size keeps its 256 default.
+        rep.char_to_id = meta["vocab"]
+        rep.id_to_char = {idx: ch for ch, idx in meta["vocab"].items()}
+        rep.config.vocab_size = meta["vocab_size"]
     elif name == "bpe":
         rep = BPERepresentation(block_size=block_size)
     elif name == "bpe_dropout":
@@ -173,7 +179,11 @@ def generate_samples(model, rep, n_samples: int = 3, max_new_tokens: int = 200) 
                     g_seq = model.config.global_seq_len
                     idx = torch.randint(0, 256, (1, 1, p_size), device=device)
                 else:
-                    idx = torch.randint(0, rep.vocab_size, (1, 1), device=device)
+                    # Draw the seed token from the model's true embedding size,
+                    # not rep.vocab_size — they can differ (e.g. small-BPE whose
+                    # actual vocab is below the requested target), and an
+                    # out-of-range index triggers a CUDA device-side assert.
+                    idx = torch.randint(0, model.config.vocab_size, (1, 1), device=device)
             else:
                 if isinstance(model, MegabyteModel):
                     # Reshape bytes into patches
@@ -383,7 +393,7 @@ def train_one_representation(
 
     out_path = Path(out_dir) / f"{rep_name}_metrics.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(metrics, indent=2))
+    out_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print(f"\n  → Saved metrics to {out_path}", flush=True)
     print(f"  Best val loss: {best_val_loss:.4f}, BPC: {metrics['best_bpc']:.4f}\n", flush=True)
 
@@ -391,6 +401,12 @@ def train_one_representation(
 
 
 def main():
+    # Force UTF-8 console output: Windows consoles default to a locale codec
+    # (e.g. cp1250) that can't encode the → characters in progress messages.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--rep", required=True,
                         help="Which representation to train (byte, char, bpe, patch, bpe1000, bpe4000, bpe8000, word, bpe_dropout, ngram2, ngram3, mamba)")

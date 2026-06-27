@@ -3,9 +3,10 @@ import sys
 import os
 from pathlib import Path
 
-# Force unbuffered
-sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 1)  # line buffered
-sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', 1)
+# Force unbuffered + UTF-8 (Windows consoles default to a locale codec like
+# cp1250 that can't encode the → / ✓ / ⚠ characters in progress messages).
+sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 1, encoding='utf-8')  # line buffered
+sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', 1, encoding='utf-8')
 
 # Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

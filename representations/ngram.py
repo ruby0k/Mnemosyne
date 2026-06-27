@@ -134,14 +134,14 @@ class NgramByteRepresentation(Representation):
                 "train_tokens": len(train), "val_tokens": len(val),
                 "dtype": "uint16" if dtype == np.uint16 else "uint8",
                 "chars_per_token": cpt}
-        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return meta
 
     def load_vocab(self, data_dir: str | Path):
         """Load vocabulary from a prepared data directory."""
         vocab_path = Path(data_dir) / "vocab.json"
         if vocab_path.exists():
-            raw = json.loads(vocab_path.read_text())
+            raw = json.loads(vocab_path.read_text(encoding="utf-8"))
             self._ngram2id = {tuple(k): v for k, v in raw["ngram2id"]}
             self._id2ngram = {int(k): tuple(v) for k, v in raw["id2ngram"].items()}
 

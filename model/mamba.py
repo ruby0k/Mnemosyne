@@ -87,11 +87,18 @@ class MambaBlock(nn.Module):
         self.out_proj = nn.Linear(d_inner, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
+        # Pre-norm applied before the mixer; the block is wrapped in a residual
+        # (matching the transformer Block). Without this the signal and gradient
+        # decay to zero through the stack and the model never learns.
+        self.norm = RMSNorm(config.d_model)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: [batch, seq, d_model]
         Returns: [batch, seq, d_model]
         """
+        residual = x
+        x = self.norm(x)
         b, t, d = x.shape
 
         # 1. Input projection → gated branches
@@ -122,11 +129,17 @@ class MambaBlock(nn.Module):
         y = y * F.silu(x_gate)
         y = self.dropout(y)
 
-        # 8. Output projection
-        return self.out_proj(y)
+        # 8. Output projection + residual connection
+        return residual + self.out_proj(y)
 
     def _selective_scan(self, x, delta, A, B, C):
-        """Simplified selective scan (non-fused Python loop).
+        """Selective scan via a blocked (sqrt-decomposition) parallel scan.
+
+        Computes the same linear recurrence as a naive per-timestep loop:
+            h_t = dA_t * h_{t-1} + dB_t * x_t,   y_t = (C_t · h_t) + D * x_t
+        but with ~2*sqrt(T) sequential Python steps instead of T, which is the
+        difference between mamba training in minutes vs. days at long context.
+        (Install mamba-ssm for fused CUDA kernels to go faster still.)
 
         Args:
             x: [b, t, d_inner] — input sequence
@@ -138,7 +151,6 @@ class MambaBlock(nn.Module):
         Returns: [b, t, d_inner]
         """
         b, t, d_inner = x.shape
-        d_state = self.config.d_state
 
         # Discretize: dA = exp(delta * A), dB = delta * B
         # delta: [b, t, d_inner] → [b, t, d_inner, 1]
@@ -147,20 +159,66 @@ class MambaBlock(nn.Module):
 
         # delta: [b, t, d_inner, 1] * B: [b, t, 1, d_state] → [b, t, d_inner, d_state]
         deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)  # [b, t, d_inner, d_state]
+        u = deltaB * x.unsqueeze(-1)                    # [b, t, d_inner, d_state] = dB_t * x_t
 
-        # Sequential scan
-        h = torch.zeros(b, d_inner, d_state, device=x.device, dtype=x.dtype)
-        ys = []
-        for i in range(t):
-            # h_{t+1} = dA_t * h_t + dB_t * x_t
-            h = deltaA[:, i] * h + deltaB[:, i] * x[:, i].unsqueeze(-1)
-            # y_t = C_t @ h_t + D * x_t
-            y_i = (h * C[:, i].unsqueeze(1)).sum(dim=-1)  # [b, d_inner]
-            ys.append(y_i)
+        h_all = self._blocked_scan(deltaA, u)           # [b, t, d_inner, d_state]
 
-        y = torch.stack(ys, dim=1)  # [b, t, d_inner]
-        y = y + x * self.D  # skip connection via D
+        # y_t = C_t · h_t  (sum over d_state)
+        y = (h_all * C.unsqueeze(2)).sum(dim=-1)        # [b, t, d_inner]
+        y = y + x * self.D                              # skip connection via D
         return y
+
+    @staticmethod
+    def _blocked_scan(a, u):
+        """Parallel scan of h_t = a_t * h_{t-1} + u_t over the time dim (dim=1).
+
+        a, u: [b, t, *rest]. Returns h: [b, t, *rest] (h_{-1} = 0).
+
+        Splits time into chunks of length ~sqrt(t): each chunk is scanned
+        independently with zero carry (a short loop, vectorised over chunks),
+        chunk boundary states are combined with a second short scan over
+        chunks, then the carry is broadcast back in. Exact, not approximate.
+        """
+        b, t = a.shape[0], a.shape[1]
+        rest = a.shape[2:]
+
+        chunk = max(1, int(round(t ** 0.5)))
+        pad = (chunk - t % chunk) % chunk
+        if pad:
+            # Pad time on the right with identity steps (a=1, u=0); causal, so
+            # padded steps never affect real outputs and are sliced off below.
+            a = F.pad(a, (0, 0) * len(rest) + (0, pad), value=1.0)
+            u = F.pad(u, (0, 0) * len(rest) + (0, pad), value=0.0)
+        T = t + pad
+        n = T // chunk
+        a = a.reshape(b, n, chunk, *rest)
+        u = u.reshape(b, n, chunk, *rest)
+
+        # Inclusive cumulative product of a within each chunk.
+        Aloc = torch.cumprod(a, dim=2)                  # [b, n, chunk, *rest]
+
+        # Local scan with zero carry (vectorised over the n chunks).
+        hs = []
+        h = torch.zeros(b, n, *rest, device=u.device, dtype=u.dtype)
+        for j in range(chunk):
+            h = a[:, :, j] * h + u[:, :, j]
+            hs.append(h)
+        hloc = torch.stack(hs, dim=2)                   # [b, n, chunk, *rest]
+
+        # Combine chunk boundaries: carry entering each chunk (scan over chunks).
+        Aprod = Aloc[:, :, -1]                          # [b, n, *rest] per-chunk product
+        hend = hloc[:, :, -1]                           # [b, n, *rest] per-chunk local end
+        carries = []
+        carry = torch.zeros(b, *rest, device=u.device, dtype=u.dtype)
+        for c in range(n):
+            carries.append(carry)
+            carry = Aprod[:, c] * carry + hend[:, c]
+        carry_in = torch.stack(carries, dim=1)          # [b, n, *rest]
+
+        # Propagate each chunk's entry carry across its positions.
+        h_all = Aloc * carry_in.unsqueeze(2) + hloc     # [b, n, chunk, *rest]
+        h_all = h_all.reshape(b, T, *rest)
+        return h_all[:, :t] if pad else h_all
 
 
 class MambaModel(nn.Module):

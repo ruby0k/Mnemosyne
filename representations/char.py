@@ -62,7 +62,7 @@ class CharRepresentation(Representation):
                 "block_size": self.block_size, "train_tokens": len(train_ids),
                 "val_tokens": len(val_ids), "dtype": "uint16",
                 "vocab": self.char_to_id}
-        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         return meta
 
     @staticmethod

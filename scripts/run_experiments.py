@@ -20,6 +20,12 @@ from pathlib import Path
 # Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Force UTF-8 console output: Windows consoles default to a locale codec
+# (e.g. cp1250) that can't encode the → / ✓ / ⚠ characters in progress messages.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 from train import train_one_representation, DEFAULT_LR
 
 
@@ -71,7 +77,7 @@ def run_all(data_root: str, out_dir: str, max_iters: int, batch_size: int,
 
     # Save combined results
     out_path = Path(out_dir) / "comparison.json"
-    out_path.write_text(json.dumps(all_metrics, indent=2))
+    out_path.write_text(json.dumps(all_metrics, indent=2), encoding="utf-8")
     print(f"\n{'='*60}", flush=True)
     print(f"COMPARISON COMPLETE — saved to {out_path}", flush=True)
     print(f"{'='*60}", flush=True)

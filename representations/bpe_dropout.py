@@ -97,5 +97,5 @@ class BPEDropoutRepresentation(BPERepresentation):
                 "train_tokens": len(train), "val_tokens": len(val),
                 "dtype": "uint16", "chars_per_token": 4.0,
                 "dropout_prob": 0.1}
-        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return meta

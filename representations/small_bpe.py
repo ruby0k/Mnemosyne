@@ -201,9 +201,9 @@ class SmallBPERepresentation(Representation):
                 "dtype": "uint16" if dtype == np.uint16 else "uint8",
                 "chars_per_token": cpt,
                 "num_merges": len(self._merges)}
-        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         (out_dir / "merges.json").write_text(json.dumps(
-            [[a, b, mid] for a, b, mid in self._merges]))
+            [[a, b, mid] for a, b, mid in self._merges]), encoding="utf-8")
 
         return meta
 
@@ -211,7 +211,7 @@ class SmallBPERepresentation(Representation):
         """Load trained merges from a prepared data directory."""
         merges_path = Path(data_dir) / "merges.json"
         if merges_path.exists():
-            self._merges = [tuple(m) for m in json.loads(merges_path.read_text())]
+            self._merges = [tuple(m) for m in json.loads(merges_path.read_text(encoding="utf-8"))]
             self._merge_dict = {(a, b): mid for a, b, mid in self._merges}
 
     def bpc_from_loss(self, loss: float) -> float:

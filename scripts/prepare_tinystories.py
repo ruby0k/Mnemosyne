@@ -11,6 +11,12 @@ from pathlib import Path
 # Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Force UTF-8 console output: Windows consoles default to a locale codec
+# (e.g. cp1250) that can't encode the → / ✓ characters in progress messages.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 import numpy as np
 from datasets import load_dataset
 
@@ -53,8 +59,9 @@ def prepare_all_representations(raw_dir: Path, data_root: Path, max_docs: int = 
         ("bpe_dropout", BPEDropoutRepresentation(block_size=256, dropout_prob=0.1)),
         ("ngram2", NgramByteRepresentation(block_size=512, n=2, max_vocab=8000)),
         ("ngram3", NgramByteRepresentation(block_size=384, n=3, max_vocab=8000)),
-        # Mamba uses byte-level data (same as byte) but with longer context
-        ("mamba", ByteRepresentation(block_size=2048)),
+        # Mamba uses byte-level data; block_size matches `byte` for a fair
+        # comparison (the non-fused scan makes 2048 impractically slow).
+        ("mamba", ByteRepresentation(block_size=1024)),
     ]
 
     # Filter reps if _reps_filter is set
