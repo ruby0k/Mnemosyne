@@ -87,6 +87,12 @@ def load_representation(name: str, data_dir: str):
     elif name == "mamba":
         # Mamba is handled separately — data is byte-level
         rep = ByteRepresentation(block_size=block_size)
+    elif name == "byte_ccca":
+        # Context-conditional capacity allocation — byte-level data (reuse data/byte)
+        rep = ByteRepresentation(block_size=block_size)
+    elif name == "byte_vq":
+        # Vector-quantized embedding substrate — byte-level data (reuse data/byte)
+        rep = ByteRepresentation(block_size=block_size)
     else:
         raise ValueError(f"Unknown representation: {name}")
 
@@ -99,7 +105,11 @@ def load_representation(name: str, data_dir: str):
 
 def build_model(rep_name: str, meta: dict, n_layer: int = 6, n_head: int = 6,
                 n_embd: int = 384, n_kv_head: int | None = None,
-                grad_checkpoint: bool = False) -> torch.nn.Module:
+                grad_checkpoint: bool = False,
+                capacity_lambda: float = 0.0, uniform_width: float | None = None,
+                force_full: bool = False,
+                vq_enabled: bool = True, vq_groups: int = 8, vq_codebook: int = 256,
+                vq_beta: float = 0.25) -> torch.nn.Module:
     """Build the appropriate model for a representation."""
     if rep_name == "patch":
         cfg = MegabyteConfig(
@@ -125,6 +135,37 @@ def build_model(rep_name: str, meta: dict, n_layer: int = 6, n_head: int = 6,
             block_size=meta["block_size"],
         )
         return MambaModel(cfg)
+    elif rep_name == "byte_ccca":
+        from model.adaptive import AdaptiveCapacityTransformer, AdaptiveConfig
+        cfg = AdaptiveConfig(
+            vocab_size=meta["vocab_size"],
+            block_size=meta["block_size"],
+            n_layer=n_layer,
+            n_head=n_head,
+            n_kv_head=n_kv_head,
+            n_embd=n_embd,
+            grad_checkpoint=grad_checkpoint,
+            capacity_lambda=capacity_lambda,
+            uniform_width=uniform_width,
+            force_full=force_full,
+        )
+        return AdaptiveCapacityTransformer(cfg)
+    elif rep_name == "byte_vq":
+        from model.vq import VQTransformer, VQConfig
+        cfg = VQConfig(
+            vocab_size=meta["vocab_size"],
+            block_size=meta["block_size"],
+            n_layer=n_layer,
+            n_head=n_head,
+            n_kv_head=n_kv_head,
+            n_embd=n_embd,
+            grad_checkpoint=grad_checkpoint,
+            vq_enabled=vq_enabled,
+            n_groups=vq_groups,
+            codebook_size=vq_codebook,
+            commitment_beta=vq_beta,
+        )
+        return VQTransformer(cfg)
     else:
         cfg = ModelConfig(
             vocab_size=meta["vocab_size"],
@@ -154,6 +195,8 @@ DEFAULT_LR = {
     "ngram2": 3e-4,
     "ngram3": 2e-4,
     "mamba": 3e-4,
+    "byte_ccca": 3e-4,
+    "byte_vq": 3e-4,
 }
 
 
@@ -233,6 +276,13 @@ def train_one_representation(
     target_chars: int = 0,
     embed_lr_scale: float = 1.0,
     generate_after: bool = True,
+    capacity_lambda: float = 0.0,
+    uniform_width: float | None = None,
+    force_full: bool = False,
+    vq_enabled: bool = True,
+    vq_groups: int = 8,
+    vq_codebook: int = 256,
+    vq_beta: float = 0.25,
 ):
     """Train one representation and return metrics.
 
@@ -270,7 +320,10 @@ def train_one_representation(
     # ── Build model ───────────────────────────────────────────────────────────
     # Enable gradient checkpointing for long-sequence reps (byte, char, patch)
     use_grad_ckpt = grad_checkpoint or (block_size >= 1024 and device == "cuda")
-    model = build_model(rep_name, meta, n_layer, n_head, n_embd, n_kv_head, use_grad_ckpt).to(device)
+    model = build_model(rep_name, meta, n_layer, n_head, n_embd, n_kv_head, use_grad_ckpt,
+                        capacity_lambda=capacity_lambda, uniform_width=uniform_width,
+                        force_full=force_full, vq_enabled=vq_enabled, vq_groups=vq_groups,
+                        vq_codebook=vq_codebook, vq_beta=vq_beta).to(device)
 
     total_params = model.num_parameters()
     embed_params = model.num_embedding_parameters()
@@ -302,6 +355,7 @@ def train_one_representation(
     def estimate_loss():
         model.eval()
         losses = {}
+        widths, perps = [], []
         for split_name, data in [("train", train_data), ("val", val_data)]:
             l = torch.zeros(eval_iters)
             for k in range(eval_iters):
@@ -309,8 +363,16 @@ def train_one_representation(
                 with ctx:
                     _, loss = model(x, y)
                 l[k] = loss.item()
+                w = getattr(model, "last_avg_width", None)
+                if w is not None:
+                    widths.append(w)
+                p = getattr(model, "last_code_perplexity", None)
+                if p is not None:
+                    perps.append(p)
             losses[split_name] = l.mean().item()
         model.train()
+        losses["avg_active_width"] = sum(widths) / len(widths) if widths else None
+        losses["code_perplexity"] = sum(perps) / len(perps) if perps else None
         return losses
 
     metrics = {
@@ -326,6 +388,9 @@ def train_one_representation(
         "learning_rate": learning_rate,
         "max_iters": max_iters,
         "grad_checkpoint": use_grad_ckpt,
+        "capacity_lambda": capacity_lambda,
+        "uniform_width": uniform_width,
+        "vq_rate_bits": getattr(model, "rate_bits", None) if (rep_name == "byte_vq" and vq_enabled) else None,
         "iters": [],
     }
 
@@ -341,8 +406,11 @@ def train_one_representation(
         x, y = get_batch(train_data, "train")
         with ctx:
             _, loss = model(x, y)
+        # Add any auxiliary loss (e.g. CCCA capacity budget). BPC uses pure CE
+        # (`loss`); only the optimizer step sees the penalty.
+        step_loss = loss + getattr(model, "last_aux_loss", 0.0)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        step_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
@@ -369,9 +437,15 @@ def train_one_representation(
                 "bpc": bpc,
                 "lr": lr,
                 "loss_ema": loss_ema,
+                "avg_active_width": losses.get("avg_active_width"),
+                "code_perplexity": losses.get("code_perplexity"),
             }
             metrics["iters"].append(row)
-            print(f"  [eval] iter {iter_num}: train {losses['train']:.4f}, val {losses['val']:.4f}, BPC {bpc:.4f}", flush=True)
+            w = losses.get("avg_active_width")
+            p = losses.get("code_perplexity")
+            extra = f", width {w:.1f}" if w is not None else ""
+            extra += f", codeperp {p:.1f}" if p is not None else ""
+            print(f"  [eval] iter {iter_num}: train {losses['train']:.4f}, val {losses['val']:.4f}, BPC {bpc:.4f}{extra}", flush=True)
             if losses["val"] < best_val_loss:
                 best_val_loss = losses["val"]
 
@@ -427,6 +501,17 @@ def main():
     parser.add_argument("--embed-lr-scale", type=float, default=1.0, help="Scale embedding LR relative to model LR")
     parser.add_argument("--no-generate", action="store_true", help="Skip text generation after training")
     parser.add_argument("--grad-checkpoint", action="store_true", help="Force gradient checkpointing")
+    parser.add_argument("--capacity-lambda", type=float, default=0.0,
+                        help="CCCA: weight on the capacity budget penalty (byte_ccca)")
+    parser.add_argument("--uniform-width", type=float, default=None,
+                        help="CCCA: constant alpha in (0,1], disables the gate (Matryoshka-uniform baseline)")
+    parser.add_argument("--force-full", action="store_true",
+                        help="CCCA: force full width (mask=1), i.e. dense baseline / identity check")
+    parser.add_argument("--vq-groups", type=int, default=8, help="VQ: product-quantization groups (byte_vq)")
+    parser.add_argument("--vq-codebook", type=int, default=256, help="VQ: codes per group (byte_vq)")
+    parser.add_argument("--vq-beta", type=float, default=0.25, help="VQ: commitment loss weight (byte_vq)")
+    parser.add_argument("--vq-disabled", action="store_true",
+                        help="VQ: disable quantization (dense identity / BPC floor)")
     args = parser.parse_args()
 
     train_one_representation(
@@ -448,6 +533,13 @@ def main():
         target_chars=args.target_chars,
         embed_lr_scale=args.embed_lr_scale,
         generate_after=not args.no_generate,
+        capacity_lambda=args.capacity_lambda,
+        uniform_width=args.uniform_width,
+        force_full=args.force_full,
+        vq_enabled=not args.vq_disabled,
+        vq_groups=args.vq_groups,
+        vq_codebook=args.vq_codebook,
+        vq_beta=args.vq_beta,
     )
 
 
